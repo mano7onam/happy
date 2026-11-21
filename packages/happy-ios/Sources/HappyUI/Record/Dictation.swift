@@ -35,6 +35,7 @@ final class Dictation {
 
     private let engine = AVAudioEngine()
     private var recognition: DictationRecognition?
+    private var handyRemote: HandyRemoteDictation?
     /// The words so far.
     private var transcript = DictationTranscript()
     private var feeding: Task<Void, Never>?
@@ -50,6 +51,9 @@ final class Dictation {
         case .undetermined: return .needsAsking
         case .denied: return .microphoneDenied
         default: break
+        }
+        if HandySttRemoteClient.current() != nil {
+            return .granted
         }
         return speechAccess() ?? .needsAsking
     }
@@ -69,6 +73,9 @@ final class Dictation {
     static func ask(multilingual: Bool) async -> Access {
         if fileSource == nil, AVAudioApplication.shared.recordPermission == .undetermined {
             _ = await AVAudioApplication.requestRecordPermission()
+        }
+        if HandySttRemoteClient.current() != nil {
+            return access()
         }
         if SFSpeechRecognizer.authorizationStatus() == .notDetermined {
             _ = await askSpeech()
@@ -119,7 +126,16 @@ final class Dictation {
 
     /// Starts listening at once.
     func start() throws {
-        guard !isRunning, recognition == nil else { throw Failure.audio }
+        guard !isRunning, recognition == nil, handyRemote == nil else { throw Failure.audio }
+        if Self.fileSource == nil, let client = HandySttRemoteClient.current() {
+            let remote = HandyRemoteDictation(client: client)
+            remote.onLevel = { [weak self] value in self?.onLevel?(value) }
+            remote.onTranscript = { [weak self] finalized, volatile in self?.onTranscript?(finalized, volatile) }
+            try remote.start()
+            handyRemote = remote
+            isRunning = true
+            return
+        }
         guard let recognizer = Self.recognizer() else { throw Failure.unavailable }
         publish(DictationTranscript())
         let candidates = Self.candidates(multilingual: multilingual)
@@ -162,6 +178,11 @@ final class Dictation {
 
     /// Stops listening and waits, a moment at most, for the last words.
     func finish() async -> String {
+        if let remote = handyRemote {
+            handyRemote = nil
+            isRunning = false
+            return await remote.finish()
+        }
         guard isRunning else { return transcript.text }
         isRunning = false
         stopAudio()
@@ -180,6 +201,12 @@ final class Dictation {
 
     /// Stops listening and forgets what was heard.
     func cancel() {
+        if let remote = handyRemote {
+            handyRemote = nil
+            isRunning = false
+            remote.cancel()
+            return
+        }
         guard isRunning else { return }
         isRunning = false
         stopAudio()
