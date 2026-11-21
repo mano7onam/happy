@@ -15,7 +15,10 @@ public final class AccountController {
     }
 
     public private(set) var state: State = .signedOut {
-        didSet { onChange?(state) }
+        didSet {
+            HandySttRegistry.observe(state)
+            onChange?(state)
+        }
     }
     public var onChange: ((State) -> Void)?
     /// Candidate server for onboarding/add-account; sessions use the registry.

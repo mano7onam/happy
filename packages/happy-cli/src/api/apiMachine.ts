@@ -6,6 +6,7 @@
 import { io, Socket } from 'socket.io-client';
 import { z } from 'zod';
 import { logger } from '@/ui/logger';
+import { registerHandySttRpc } from '@/handy/handySttBridge';
 import { configuration } from '@/configuration';
 import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
 import { registerCommonHandlers, SpawnSessionOptions, SpawnSessionResult } from '../modules/common/registerCommonHandlers';
@@ -364,6 +365,8 @@ export class ApiMachineClient {
 
             return { message: 'Daemon stop request acknowledged, starting shutdown sequence...' };
         });
+
+        registerHandySttRpc(this.rpcHandlerManager);
     }
 
     private syncResumeSessionRpcRegistration(): void {
