@@ -32,8 +32,10 @@ export interface BuildAgyArgsOptions {
   permissionMode: PermissionMode;
   /** Directories to expose to agy via repeatable `--add-dir`. */
   addDirs?: string[];
-  /** Value for `--print-timeout` (e.g. "10m"). */
+  /** Value for `--print-timeout` (e.g. "10m", or "0" for no limit). */
   printTimeout?: string;
+  /** Output format for print mode (`text`, `json`, or `stream-json`). */
+  outputFormat?: 'text' | 'json' | 'stream-json';
 }
 
 /**
@@ -59,6 +61,9 @@ export function buildAgyArgs(opts: BuildAgyArgsOptions): string[] {
   }
   if (opts.printTimeout) {
     args.push('--print-timeout', opts.printTimeout);
+  }
+  if (opts.outputFormat) {
+    args.push('--output-format', opts.outputFormat);
   }
 
   args.push('--print', opts.prompt);

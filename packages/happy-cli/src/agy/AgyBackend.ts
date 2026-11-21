@@ -49,8 +49,10 @@ export interface AgyBackendOptions {
   model?: string;
   /** Initial Happy effort key; used to resolve models with agy-specific variants. */
   effort?: string;
-  /** Value for `--print-timeout`. Defaults to AGY_PRINT_TIMEOUT. */
+  /** Value for `--print-timeout`. Defaults to AGY_PRINT_TIMEOUT ("0" disables timeout). */
   printTimeout?: string;
+  /** Output format passed to `agy --output-format` ('stream-json' emits live tool & text events). */
+  outputFormat?: 'text' | 'stream-json';
   /** Optional logger. */
   log?: (msg: string) => void;
   /** Injectable spawn (defaults to node's child_process.spawn). */
@@ -63,9 +65,13 @@ export interface AgyBackendOptions {
   envOverrides?: Record<string, string>;
 }
 
-/** Parse an agy duration string ("10m", "30s", "1h") to milliseconds; defaults to 10m. */
+/** Parse an agy duration string ("10m", "30s", "1h", "0") to milliseconds; 0 disables watchdog. */
 function parsePrintTimeoutMs(value: string): number {
-  const m = /^(\d+)\s*(s|m|h)$/.exec(value.trim());
+  const trimmed = value.trim();
+  if (trimmed === '0' || trimmed === '0s' || trimmed === '0m') {
+    return 0;
+  }
+  const m = /^(\d+)\s*(s|m|h)$/.exec(trimmed);
   if (!m) return 10 * 60_000;
   const n = Number(m[1]);
   return m[2] === 'h' ? n * 3_600_000 : m[2] === 'm' ? n * 60_000 : n * 1_000;
@@ -75,6 +81,7 @@ export class AgyBackend implements AgentBackend {
   private readonly handlers = new Set<AgentMessageHandler>();
   private cwd: string;
   private readonly printTimeout: string;
+  private readonly outputFormat: 'text' | 'stream-json';
   private readonly log: (msg: string) => void;
   private readonly spawnFn: SpawnFn;
   private readonly resolveConversationId: (cwd: string) => string | null;
@@ -93,6 +100,7 @@ export class AgyBackend implements AgentBackend {
     this.model = opts.model;
     this.effort = opts.effort;
     this.printTimeout = opts.printTimeout ?? AGY_PRINT_TIMEOUT;
+    this.outputFormat = opts.outputFormat ?? (opts.spawnFn ? 'text' : 'stream-json');
     this.log = opts.log ?? (() => {});
     this.spawnFn = opts.spawnFn ?? spawn;
     this.resolveConversationId = opts.resolveConversationId ?? readAgyConversationId;
@@ -143,14 +151,20 @@ export class AgyBackend implements AgentBackend {
     return { sessionId: this.cwd };
   }
 
-  async sendPrompt(_sessionId: SessionId, prompt: string): Promise<void> {
+  async sendPrompt(
+    _sessionId: SessionId,
+    prompt: string,
+    opts?: { addDirs?: readonly string[] },
+  ): Promise<void> {
+    const addDirs = Array.from(new Set([this.cwd, ...(opts?.addDirs ?? [])].filter(Boolean)));
     const args = buildAgyArgs({
       prompt,
       model: this.model ? resolveAgyModelName(this.model, this.effort) : undefined,
       conversationId: this.conversationId,
       permissionMode: this.permissionMode,
-      addDirs: [this.cwd],
+      addDirs,
       printTimeout: this.printTimeout,
+      outputFormat: this.outputFormat === 'stream-json' ? 'stream-json' : undefined,
     });
 
     this.emit({ type: 'status', status: 'running' });
@@ -178,21 +192,137 @@ export class AgyBackend implements AgentBackend {
       // Node can fire both 'error' and 'close' on spawn failure; act on the first only.
       let settled = false;
       let stderrTail = '';
-      const watchdog = setTimeout(() => {
-        this.log(`agy turn exceeded ${this.printTimeout}; killing process`);
-        child.kill('SIGKILL');
-      }, parsePrintTimeoutMs(this.printTimeout) + 30_000);
+      const timeoutMs = parsePrintTimeoutMs(this.printTimeout);
+      const watchdog = timeoutMs > 0
+        ? setTimeout(() => {
+            this.log(`agy turn exceeded ${this.printTimeout}; killing process`);
+            child.kill('SIGKILL');
+          }, timeoutMs + 30_000)
+        : null;
       const cleanup = () => {
-        clearTimeout(watchdog);
+        if (watchdog) {
+          clearTimeout(watchdog);
+        }
         if (this.child === child) {
           this.child = null;
         }
       };
 
+      let lineBuf = '';
+      let emittedTextDelta = false;
+      const startedTools = new Set<string>();
+
+      const handleStreamLine = (rawLine: string, isFinalFlush = false) => {
+        const trimmed = rawLine.trim();
+        if (!trimmed) return;
+        if (!trimmed.startsWith('{')) {
+          const suffix = isFinalFlush ? '' : '\n';
+          this.emit({ type: 'model-output', textDelta: `${rawLine}${suffix}` });
+          emittedTextDelta = true;
+          return;
+        }
+        try {
+          const ev = JSON.parse(trimmed) as Record<string, unknown>;
+          const eventType = ev.event;
+          if (eventType === 'init' && typeof ev.conversation_id === 'string' && ev.conversation_id) {
+            if (this.conversationId !== ev.conversation_id) {
+              this.conversationId = ev.conversation_id;
+              this.log(`pinned agy conversation from stream-json init: ${ev.conversation_id}`);
+            }
+            return;
+          }
+          if (eventType === 'step_update' && ev.step_update && typeof ev.step_update === 'object') {
+            const su = ev.step_update as Record<string, unknown>;
+            const stepType = String(su.step_type ?? '');
+            const state = String(su.state ?? '');
+            const stepIndex = su.step_index ?? 0;
+
+            if (typeof su.thinking_delta === 'string' && su.thinking_delta) {
+              this.emit({
+                type: 'event',
+                name: 'thinking',
+                payload: { text: su.thinking_delta, streaming: true },
+              });
+            }
+
+            if (stepType === 'tool') {
+              const callId = `step-${String(stepIndex)}`;
+              const toolInfo =
+                su.tool_info && typeof su.tool_info === 'object'
+                  ? (su.tool_info as Record<string, unknown>)
+                  : undefined;
+              const toolName = String(su.tool_name || toolInfo?.name || 'tool');
+              if (state === 'ACTIVE' && !startedTools.has(callId)) {
+                startedTools.add(callId);
+                const rawParams =
+                  toolInfo?.parameters && typeof toolInfo.parameters === 'object'
+                    ? (toolInfo.parameters as Record<string, unknown>)
+                    : {};
+                this.emit({
+                  type: 'tool-call',
+                  callId,
+                  toolName,
+                  args: rawParams,
+                });
+              } else if (state === 'DONE' || state === 'ERROR') {
+                if (!startedTools.has(callId)) {
+                  startedTools.add(callId);
+                  this.emit({
+                    type: 'tool-call',
+                    callId,
+                    toolName,
+                    args: {},
+                  });
+                }
+                this.emit({
+                  type: 'tool-result',
+                  callId,
+                  toolName,
+                  result: toolInfo?.output ?? '',
+                });
+              }
+              return;
+            }
+
+            if (stepType === 'agent_response' && typeof su.text_delta === 'string' && su.text_delta.length > 0) {
+              emittedTextDelta = true;
+              this.emit({ type: 'model-output', textDelta: su.text_delta });
+              return;
+            }
+            return;
+          }
+          if (eventType === 'result' && ev.result && typeof ev.result === 'object') {
+            const res = ev.result as Record<string, unknown>;
+            if (typeof res.conversation_id === 'string' && res.conversation_id) {
+              this.conversationId = res.conversation_id;
+            }
+            if (!emittedTextDelta && typeof res.response === 'string' && res.response.length > 0) {
+              emittedTextDelta = true;
+              this.emit({ type: 'model-output', textDelta: res.response });
+            }
+            return;
+          }
+        } catch {
+          const suffix = isFinalFlush ? '' : '\n';
+          this.emit({ type: 'model-output', textDelta: `${rawLine}${suffix}` });
+          emittedTextDelta = true;
+        }
+      };
+
       child.stdout?.setEncoding('utf8');
       child.stdout?.on('data', (chunk: string) => {
-        if (chunk) {
+        if (!chunk) return;
+        if (this.outputFormat !== 'stream-json') {
           this.emit({ type: 'model-output', textDelta: chunk });
+          return;
+        }
+        lineBuf += chunk;
+        let nlIdx = lineBuf.indexOf('\n');
+        while (nlIdx !== -1) {
+          const line = lineBuf.slice(0, nlIdx).replace(/\r$/, '');
+          lineBuf = lineBuf.slice(nlIdx + 1);
+          handleStreamLine(line, false);
+          nlIdx = lineBuf.indexOf('\n');
         }
       });
 
@@ -220,15 +350,12 @@ export class AgyBackend implements AgentBackend {
         if (settled) return;
         settled = true;
         cleanup();
-        // Pin the conversation our first turn created so later turns resume it.
-        // Once pinned, never re-read the cache: another session in the same cwd
-        // may have updated it since, and adopting that id would cross-resume.
-        // Best effort while unpinned: any concurrent same-cwd write that differs
-        // from the pre-turn snapshot (another session's turn, or bare interactive
-        // agy) would be adopted just the same — agy doesn't echo the id it
-        // created, so we cannot attribute the cache entry more precisely.
-        // Deliberately runs on failed turns too: agy may have created the
-        // conversation before the turn errored, and resuming it keeps context.
+        if (this.outputFormat === 'stream-json' && lineBuf.trim().length > 0) {
+          handleStreamLine(lineBuf.replace(/\r$/, ''), true);
+          lineBuf = '';
+        }
+        // Fallback cache pinning if stream-json init did not provide conversation_id
+        // (e.g. plain text outputFormat or older agy binary).
         if (this.conversationId === null) {
           const cid = this.resolveConversationId(this.cwd);
           if (cid && cid !== preTurnCacheId) {

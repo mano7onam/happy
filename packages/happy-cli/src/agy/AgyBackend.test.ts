@@ -340,4 +340,64 @@ describe('AgyBackend', () => {
     child.emit('close', null);
     await expect(turn).rejects.toThrow();
   });
+
+  it('streams tool-call, tool-result, text_delta, and pins conversation_id in stream-json mode', async () => {
+    const spawnCalls: string[][] = [];
+    let current = makeFakeChild();
+    const spawnFn = vi.fn((_bin: string, args: string[]) => {
+      spawnCalls.push(args);
+      return current.child;
+    }) as unknown as SpawnFn;
+
+    const backend = new AgyBackend({
+      cwd: '/work',
+      permissionMode: 'default',
+      printTimeout: '0',
+      outputFormat: 'stream-json',
+      spawnFn,
+      resolveConversationId: () => null,
+    });
+    const messages: AgentMessage[] = [];
+    backend.onMessage((m) => messages.push(m));
+
+    await backend.startSession();
+    const t1 = backend.sendPrompt('/work', 'inspect image');
+    current.stdout.emit(
+      'data',
+      '{"event":"init","conversation_id":"stream-cid-1"}\n' +
+        '{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"read_file","tool_info":{"name":"read_file","parameters":{"Path":"/tmp/a.png"}}}}\n',
+    );
+    current.stdout.emit(
+      'data',
+      '{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"tool","tool_name":"read_file","tool_info":{"name":"read_file","output":"image/png"}}}\n' +
+        '{"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE","step_type":"agent_response","text_delta":"Looks good!"}}\n' +
+        '{"event":"result","result":{"conversation_id":"stream-cid-1","status":"SUCCESS","response":"Looks good!"}}\n',
+    );
+    current.child.emit('close', 0);
+    await t1;
+
+    expect(spawnCalls[0]).toContain('--output-format');
+    expect(spawnCalls[0][spawnCalls[0].indexOf('--output-format') + 1]).toBe('stream-json');
+    expect(messages).toContainEqual({
+      type: 'tool-call',
+      callId: 'step-1',
+      toolName: 'read_file',
+      args: { Path: '/tmp/a.png' },
+    });
+    expect(messages).toContainEqual({
+      type: 'tool-result',
+      callId: 'step-1',
+      toolName: 'read_file',
+      result: 'image/png',
+    });
+    expect(messages.filter((m) => m.type === 'model-output')).toEqual([
+      { type: 'model-output', textDelta: 'Looks good!' },
+    ]);
+
+    current = makeFakeChild();
+    const t2 = backend.sendPrompt('/work', 'next');
+    current.child.emit('close', 0);
+    await t2;
+    expect(spawnCalls[1][spawnCalls[1].indexOf('--conversation') + 1]).toBe('stream-cid-1');
+  });
 });

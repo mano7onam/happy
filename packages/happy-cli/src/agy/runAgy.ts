@@ -209,6 +209,8 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
     permissionMode: initialPermissionMode,
     model: selectedModel,
     effort: selectedEffort,
+    printTimeout: process.env.HAPPY_AGY_PRINT_TIMEOUT?.trim() || '0',
+    outputFormat: 'stream-json',
     agyBinOverride: process.env.HAPPY_AGY_PATH?.trim() || (hasSpyToolkit ? spyShimPath : undefined),
     envOverrides: buildSpyEnvOverrides(),
     log,
@@ -389,10 +391,13 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
     return '.jpg';
   };
 
-  session.onUserMessage(async (message) => {
-    const attachmentsForThisMessage = await session.drainAttachmentsForUserMessage();
-    const rawUserText = message.content?.text ?? '';
-    if (!rawUserText && attachmentsForThisMessage.length === 0) return;
+  let userMessageChain = Promise.resolve();
+  session.onUserMessage((message) => {
+    userMessageChain = userMessageChain
+      .then(async () => {
+        const attachmentsForThisMessage = await session.drainAttachmentsForUserMessage();
+        const rawUserText = message.content?.text ?? '';
+        if (!rawUserText && attachmentsForThisMessage.length === 0) return;
 
     if (message.meta?.permissionMode) {
       const mode = normalizeRemotePermissionMode(message.meta.permissionMode);
@@ -608,6 +613,10 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
 
     messageBuffer.addMessage(outgoingPrompt, 'user');
     messageQueue.push(outgoingPrompt, {});
+      })
+      .catch((err) => {
+        logger.debug('[agy] Error handling user message:', err);
+      });
   });
   session.keepAlive(thinking, 'remote');
 
@@ -751,7 +760,11 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
       await modelsReady;
       sendEnvelopes(sessionManager.startTurn());
       try {
-        await backend.sendPrompt(backend.getCwd(), batch.message);
+        await backend.sendPrompt(
+          backend.getCwd(),
+          batch.message,
+          existsSync(attachmentsDir) ? { addDirs: [attachmentsDir] } : undefined,
+        );
         sendEnvelopes(sessionManager.endTurn('completed'));
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
