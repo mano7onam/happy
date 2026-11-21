@@ -11,6 +11,10 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import { basename, extname, join } from 'node:path';
 import React from 'react';
 import { render, type Instance as InkInstance } from 'ink';
 import { ApiClient } from '@/api/api';
@@ -76,23 +80,68 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
     metadata: initialMachineMetadata,
   });
 
-  let selectedModel = opts.model ? normalizeAgyModelAlias(opts.model) : DEFAULT_AGY_MODEL;
-  let selectedEffort = opts.effort ? normalizeAgyEffort(opts.effort) : DEFAULT_AGY_EFFORT;
+  const homeDir = os.homedir();
+  const spyCliPath = join(homeDir, '.local', 'bin', 'agy-spy');
+  const spyShimPath = join(homeDir, 'dev', 'agy-happy-spy', 'bin', 'agy-spy-shim');
+  const spyConfigPath = join(homeDir, '.agy-happy-spy', 'config.json');
+  const hasSpyToolkit = existsSync(spyCliPath) && existsSync(spyShimPath);
+
+  let configuredDefaultModel: string | undefined;
+  let configuredDefaultEffort: string | undefined;
+  if (!opts.model && existsSync(spyConfigPath)) {
+    try {
+      const rawCfg = JSON.parse(readFileSync(spyConfigPath, 'utf8')) as { model?: string; effort?: string };
+      configuredDefaultModel = rawCfg.model;
+      configuredDefaultEffort = rawCfg.effort;
+    } catch {
+      // ignore invalid config.json
+    }
+  }
+
+  let selectedModel = opts.model
+    ? normalizeAgyModelAlias(opts.model)
+    : configuredDefaultModel
+      ? normalizeAgyModelAlias(configuredDefaultModel)
+      : DEFAULT_AGY_MODEL;
+  let selectedEffort = opts.effort
+    ? normalizeAgyEffort(opts.effort)
+    : configuredDefaultEffort
+      ? normalizeAgyEffort(configuredDefaultEffort)
+      : DEFAULT_AGY_EFFORT;
   let displayedModel = resolveAgyModelName(selectedModel, selectedEffort);
   // Started now, answered after the session is up: `agy models` can take seconds.
   const modelDiscovery = discoverAgyModelOptions();
   let availableModels = [...FALLBACK_AGY_MODEL_OPTIONS];
 
+  const enableMobileAttachments = process.env.HAPPY_AGY_ATTACHMENTS !== '0';
+  const attachmentsDir = join(homeDir, '.agy-happy-spy', 'attachments', sessionTag.slice(0, 8));
+
+  // Shipped iOS/Android Happy clients gate composer photo/screenshot attachments on
+  // `flavor == "claude" || flavor == "codex"`, while still rendering `metadata.models`
+  // (Gemini 4 Neon/Carbon/Argon/Hydrogen, Orchestrator, Flash) and the effort picker.
   const { state, metadata } = createSessionMetadata({
-    flavor: 'agy',
+    flavor: enableMobileAttachments ? 'claude' : 'agy',
     machineId: settings.machineId,
     startedBy: opts.startedBy,
   });
   metadata.models = availableModels;
   metadata.currentModelCode = selectedModel;
+  const customSessionTitle = process.env.HAPPY_SESSION_TITLE?.trim();
+  if (customSessionTitle) {
+    metadata.name = customSessionTitle;
+    metadata.summary = { text: customSessionTitle, updatedAt: Date.now() };
+  }
   const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
   if (response) {
     log(`Happy Session ID: ${response.id}`);
+    const sessionIdOutPath = process.env.HAPPY_SESSION_ID_OUT?.trim();
+    if (sessionIdOutPath) {
+      try {
+        writeFileSync(sessionIdOutPath, `${response.id}\n`, 'utf8');
+      } catch (err) {
+        logger.debug('[agy] Failed to write HAPPY_SESSION_ID_OUT:', err);
+      }
+    }
   }
 
   let session: ApiSessionClient;
@@ -129,13 +178,61 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
   let thinking = false;
   let errorReportedForCurrentTurn = false;
 
+  let activeFeedPath = process.env.HAPPY_SPY_FEED_JSONL?.trim() || '';
+  let activeTargetSid = process.env.AGY_SPY_TARGET_SESSION?.trim() || '';
+  let activeSpyMode = process.env.AGY_SPY_MODE?.trim() || (activeTargetSid ? 'companion' : 'hub');
+  let activeStateFile = process.env.AGY_SPY_STATE_FILE?.trim() || '';
+  let feedOffset = 0;
+
+  const buildSpyEnvOverrides = (): Record<string, string> | undefined => {
+    if (!hasSpyToolkit) return undefined;
+    return {
+      AGY_SPY_TARGET_SESSION: activeTargetSid,
+      AGY_SPY_MODE: activeSpyMode,
+      AGY_SPY_STATE_FILE: activeStateFile,
+      AGY_SPY_FORCE_YOLO: '1',
+      PYTHONPATH: [
+        join(homeDir, 'dev', 'agy-happy-spy'),
+        join(homeDir, 'dev', 'puenteo'),
+        process.env.PYTHONPATH || '',
+      ].filter(Boolean).join(':'),
+    };
+  };
+
+  const initialPermissionMode: PermissionMode =
+    (!opts.permissionMode || opts.permissionMode === 'default') && hasSpyToolkit
+      ? 'bypassPermissions'
+      : (opts.permissionMode ?? 'default');
+
   const backend = new AgyBackend({
     cwd: process.cwd(),
-    permissionMode: opts.permissionMode ?? 'default',
+    permissionMode: initialPermissionMode,
     model: selectedModel,
     effort: selectedEffort,
+    agyBinOverride: process.env.HAPPY_AGY_PATH?.trim() || (hasSpyToolkit ? spyShimPath : undefined),
+    envOverrides: buildSpyEnvOverrides(),
     log,
   });
+
+  const runSpyMobileCtl = (ctlArgs: string[]): Record<string, unknown> | null => {
+    if (!hasSpyToolkit) return null;
+    try {
+      const out = execFileSync('python3', [spyCliPath, 'mobile-ctl', ...ctlArgs], {
+        encoding: 'utf8',
+        timeout: 25_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          PATH: `${join(homeDir, '.local', 'bin')}:/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || '/usr/bin:/bin'}`,
+        },
+      });
+      const lastLine = out.trim().split('\n').pop() || '';
+      return lastLine ? (JSON.parse(lastLine) as Record<string, unknown>) : null;
+    } catch (err) {
+      logger.debug('[agy] mobile-ctl failed:', err);
+      return null;
+    }
+  };
 
   // Terminal UI (only with a real TTY; the daemon runs headless).
   const messageBuffer = new MessageBuffer();
@@ -261,8 +358,41 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
     logger.debug('[agy] Applying agy models failed:', error);
   });
 
-  session.onUserMessage((message) => {
-    if (!message.content.text) return;
+  session.onFileEvent((fileEvent) => {
+    const ev = fileEvent.content.data.ev;
+    log(`File attachment event received: ${ev.name} (${ev.size} bytes)`);
+    const downloadPromise = (async (): Promise<{ data: Uint8Array; mimeType: string; name: string } | null> => {
+      try {
+        const decrypted = await session.downloadAndDecryptAttachment(ev.ref);
+        if (!decrypted) {
+          log(`Failed to decrypt attachment: ${ev.name}`);
+          return null;
+        }
+        return { data: decrypted, mimeType: ev.mimeType ?? 'image/png', name: ev.name || 'screenshot.png' };
+      } catch (error) {
+        logger.debug('[agy] Failed to download attachment:', error);
+        return null;
+      }
+    })();
+    session.trackAttachmentDownload(downloadPromise);
+  });
+
+  const extensionForMime = (mimeType: string, rawName: string): string => {
+    const existing = extname(rawName);
+    if (existing) return '';
+    const m = mimeType.toLowerCase();
+    if (m.includes('png')) return '.png';
+    if (m.includes('webp')) return '.webp';
+    if (m.includes('gif')) return '.gif';
+    if (m.includes('heic')) return '.heic';
+    if (m.includes('pdf')) return '.pdf';
+    return '.jpg';
+  };
+
+  session.onUserMessage(async (message) => {
+    const attachmentsForThisMessage = await session.drainAttachmentsForUserMessage();
+    const rawUserText = message.content?.text ?? '';
+    if (!rawUserText && attachmentsForThisMessage.length === 0) return;
 
     if (message.meta?.permissionMode) {
       const mode = normalizeRemotePermissionMode(message.meta.permissionMode);
@@ -273,23 +403,46 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
 
     const incomingModel = message.meta?.hasOwnProperty('model') ? message.meta.model : undefined;
     const incomingEffort = message.meta?.hasOwnProperty('effort') ? message.meta.effort : undefined;
-    const remoteModelChanged = incomingModel && incomingModel !== lastRemoteModel;
+    // Ignore ambient Claude default slugs ("opus", "sonnet", "claude-opus-...") sent by the mobile
+    // client before the user explicitly picks from `metadata.models` when `flavor` is set to 'claude'.
+    const isExplicitAgyModel =
+      !incomingModel ||
+      availableModelCodes.includes(incomingModel) ||
+      /^(Gemini |Orchestrator|Claude Opus 5\.5|Claude Sonnet 5\.5|GPT-OSS)/i.test(incomingModel);
+    const effectiveIncomingModel = isExplicitAgyModel ? incomingModel : undefined;
+    const remoteModelChanged = Boolean(effectiveIncomingModel && effectiveIncomingModel !== lastRemoteModel);
     const remoteEffortChanged = incomingEffort !== undefined && incomingEffort !== lastRemoteEffort;
 
-    if (incomingModel !== undefined) {
-      lastRemoteModel = incomingModel ?? undefined;
+    if (effectiveIncomingModel !== undefined) {
+      lastRemoteModel = effectiveIncomingModel ?? undefined;
     }
     if (incomingEffort !== undefined) {
       lastRemoteEffort = incomingEffort;
     }
 
     if (remoteModelChanged || remoteEffortChanged) {
-      const nextModel = incomingModel ? normalizeAgyModelAlias(incomingModel) : selectedModel;
+      const nextModel = effectiveIncomingModel ? normalizeAgyModelAlias(effectiveIncomingModel) : selectedModel;
       const nextEffort = incomingEffort !== undefined ? normalizeAgyEffort(incomingEffort) : selectedEffort;
       syncDisplayedModel(nextModel, nextEffort);
     }
 
-    const trimmedText = message.content.text.trim();
+    const savedAttachmentPaths: string[] = [];
+    if (attachmentsForThisMessage.length > 0) {
+      try {
+        mkdirSync(attachmentsDir, { recursive: true });
+        attachmentsForThisMessage.forEach((att, idx) => {
+          const cleanBase = basename(att.name || `image-${idx + 1}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+          const ext = extensionForMime(att.mimeType, cleanBase);
+          const filePath = join(attachmentsDir, `${Date.now()}-${idx + 1}-${cleanBase}${ext}`);
+          writeFileSync(filePath, Buffer.from(att.data));
+          savedAttachmentPaths.push(filePath);
+        });
+      } catch (err) {
+        logger.debug('[agy] Failed to persist decrypted attachments:', err);
+      }
+    }
+
+    const trimmedText = rawUserText.trim();
     if (/^\/models$/i.test(trimmedText)) {
       const listText = availableModelCodes
         .map((code, idx) => `${idx + 1}. ${code}${code === selectedModel ? ` ✓ (current: ${displayedModel})` : ''}`)
@@ -323,8 +476,138 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
       return;
     }
 
-    messageBuffer.addMessage(message.content.text, 'user');
-    messageQueue.push(message.content.text, {});
+    if (hasSpyToolkit && /^\/(sessions|agy|list)$/i.test(trimmedText)) {
+      const res = runSpyMobileCtl(['sessions', '--active', activeTargetSid]);
+      const reply = typeof res?.text === 'string' ? res.text : 'Не удалось получить список сессий Antigravity.';
+      emitSyntheticAgentCard(reply);
+      return;
+    }
+
+    const spyAttachMatch = /^\/(spy|relay)(?:\s+(.*))?$/i.exec(trimmedText);
+    if (hasSpyToolkit && spyAttachMatch) {
+      const cmdKind = spyAttachMatch[1].toLowerCase() === 'relay' ? 'relay' : 'companion';
+      const query = (spyAttachMatch[2] || 'current').trim() || 'current';
+      const res = runSpyMobileCtl([
+        'attach',
+        '--query', query,
+        '--mode', cmdKind,
+        '--pid', String(process.pid),
+        '--happy-id', response?.id || '',
+        '--model', selectedModel,
+        '--effort', selectedEffort,
+      ]);
+      if (res && res.ok) {
+        activeTargetSid = String(res.target_session_id || '');
+        activeSpyMode = String(res.mode || cmdKind);
+        activeStateFile = String(res.state_path || activeStateFile);
+        const nextFeed = String(res.feed_path || '');
+        if (nextFeed && nextFeed !== activeFeedPath) {
+          activeFeedPath = nextFeed;
+          feedOffset = existsSync(activeFeedPath) ? readFileSync(activeFeedPath, 'utf8').length : 0;
+        }
+        const nextCwd = String(res.cwd || backend.getCwd());
+        backend.setCwd(nextCwd);
+        backend.resetConversation();
+        backend.setEnvOverrides(buildSpyEnvOverrides());
+        const nextTitle = String(res.title || '');
+        if (nextTitle) {
+          session.updateMetadata((curr) => ({
+            ...curr,
+            path: nextCwd,
+            name: nextTitle,
+            summary: { text: nextTitle, updatedAt: Date.now() },
+          }));
+        }
+        emitSyntheticAgentCard(String(res.card || `Подключено к сессии ${activeTargetSid}`));
+      } else {
+        emitSyntheticAgentCard(`❌ ${String(res?.error || 'Не удалось подключиться к сессии Antigravity.')}`);
+      }
+      return;
+    }
+
+    if (hasSpyToolkit && /^\/(unspy|fresh)$/i.test(trimmedText)) {
+      const res = runSpyMobileCtl([
+        'detach',
+        '--cwd', backend.getCwd(),
+        '--pid', String(process.pid),
+        '--happy-id', response?.id || '',
+        '--model', selectedModel,
+        '--effort', selectedEffort,
+      ]);
+      activeTargetSid = '';
+      activeSpyMode = 'hub';
+      activeFeedPath = '';
+      if (res?.state_path) {
+        activeStateFile = String(res.state_path);
+      }
+      backend.resetConversation();
+      backend.setEnvOverrides(buildSpyEnvOverrides());
+      const nextTitle = String(res?.title || '');
+      if (nextTitle) {
+        session.updateMetadata((curr) => ({
+          ...curr,
+          name: nextTitle,
+          summary: { text: nextTitle, updatedAt: Date.now() },
+        }));
+      }
+      emitSyntheticAgentCard(String(res?.card || '✅ Отвязался от десктопной сессии.'));
+      return;
+    }
+
+    const newDesktopMatch = /^\/desktop\s+([\s\S]+)$/i.exec(trimmedText);
+    if (hasSpyToolkit && newDesktopMatch) {
+      const firstPrompt = newDesktopMatch[1].trim();
+      emitSyntheticAgentCard('⏳ Открываю новую сессию прямо в приложении `Antigravity.app` на твоём Маке…');
+      const res = runSpyMobileCtl([
+        'new-desktop',
+        '--query', firstPrompt,
+        '--mode', 'companion',
+        '--pid', String(process.pid),
+        '--happy-id', response?.id || '',
+        '--model', selectedModel,
+        '--effort', selectedEffort,
+      ]);
+      if (res && res.ok) {
+        activeTargetSid = String(res.target_session_id || '');
+        activeSpyMode = String(res.mode || 'companion');
+        activeStateFile = String(res.state_path || activeStateFile);
+        activeFeedPath = String(res.feed_path || '');
+        feedOffset = 0;
+        const nextCwd = String(res.cwd || backend.getCwd());
+        backend.setCwd(nextCwd);
+        backend.resetConversation();
+        backend.setEnvOverrides(buildSpyEnvOverrides());
+        const nextTitle = String(res.title || '');
+        if (nextTitle) {
+          session.updateMetadata((curr) => ({
+            ...curr,
+            path: nextCwd,
+            name: nextTitle,
+            summary: { text: nextTitle, updatedAt: Date.now() },
+          }));
+        }
+        emitSyntheticAgentCard(
+          `✅ **Новая сессия открыта прямо в Antigravity Desktop на Маке!**\n\n${String(res.card || '')}`,
+        );
+      } else {
+        emitSyntheticAgentCard(`❌ Не удалось открыть новую сессию в Antigravity Desktop: ${String(res?.error || 'unknown error')}`);
+      }
+      return;
+    }
+
+    let outgoingPrompt = rawUserText;
+    if (savedAttachmentPaths.length > 0) {
+      const filesList = savedAttachmentPaths.map((p) => `- ${p}`).join('\n');
+      const header =
+        `[Прикреплены скриншоты/изображения с телефона (${savedAttachmentPaths.length} шт.). ` +
+        `Обязательно открой и посмотри каждый файл через инструмент \`read_file\` перед ответом:\n${filesList}]`;
+      outgoingPrompt = rawUserText.trim()
+        ? `${header}\n\n${rawUserText}`
+        : `${header}\n\nПосмотри на прикреплённый скриншот и опиши, что видишь / помоги с этим.`;
+    }
+
+    messageBuffer.addMessage(outgoingPrompt, 'user');
+    messageQueue.push(outgoingPrompt, {});
   });
   session.keepAlive(thinking, 'remote');
 
@@ -346,15 +629,111 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
   }
 
   session.rpcHandlerManager.registerHandler('abort', handleAbort);
-  registerKillSessionHandler(session.rpcHandlerManager, async () => {
+  const requestGracefulShutdown = async () => {
+    if (shouldExit) return;
     shouldExit = true;
     messageQueue.close();
     await handleAbort();
-  });
+  };
+  registerKillSessionHandler(session.rpcHandlerManager, requestGracefulShutdown);
+  const onSigTerm = () => {
+    void requestGracefulShutdown();
+  };
+  process.once('SIGTERM', onSigTerm);
+  if (!hasTTY) {
+    process.once('SIGINT', onSigTerm);
+  }
+
+  const emitSyntheticAgentCard = (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    if (hasTTY) {
+      messageBuffer.addMessage(trimmed, 'assistant');
+    }
+    sendEnvelopes(sessionManager.startTurn());
+    sendEnvelopes(sessionManager.mapMessage({ type: 'model-output', textDelta: trimmed }));
+    sendEnvelopes(sessionManager.endTurn('completed'));
+    session.sendSessionEvent({ type: 'ready' });
+  };
+
+  const feedInterval = setInterval(() => {
+    if (thinking || shouldExit || !activeFeedPath || !existsSync(activeFeedPath)) return;
+    try {
+      const content = readFileSync(activeFeedPath, 'utf8');
+      if (content.length <= feedOffset) return;
+      const slice = content.slice(feedOffset);
+      const lastNl = slice.lastIndexOf('\n');
+      if (lastNl === -1) return;
+      feedOffset += lastNl + 1;
+      const lines = slice.slice(0, lastNl).split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const payload = JSON.parse(line) as { text?: string; title?: string };
+          if (payload.title) {
+            session.updateMetadata((curr) => ({
+              ...curr,
+              name: payload.title,
+              summary: { text: payload.title!, updatedAt: Date.now() },
+            }));
+          }
+          if (payload.text) {
+            emitSyntheticAgentCard(payload.text);
+          }
+        } catch {
+          // ignore malformed line
+        }
+      }
+    } catch {
+      // ignore transient read errors
+    }
+  }, 1500);
 
   try {
     await backend.startSession();
     log('Backend ready');
+
+    const initialNoteFile = process.env.HAPPY_SPY_INITIAL_NOTE_FILE?.trim();
+    if (initialNoteFile && existsSync(initialNoteFile)) {
+      try {
+        const initialNote = readFileSync(initialNoteFile, 'utf8');
+        emitSyntheticAgentCard(initialNote);
+      } catch (err) {
+        logger.debug('[agy] Failed to read HAPPY_SPY_INITIAL_NOTE_FILE:', err);
+      }
+    } else if (hasSpyToolkit && !activeTargetSid) {
+      // Auto-initialize sessions created directly from the Happy mobile app (`+ -> Antigravity`)!
+      const initRes = runSpyMobileCtl([
+        'init',
+        '--cwd', backend.getCwd(),
+        '--pid', String(process.pid),
+        '--happy-id', response?.id || '',
+        '--model', selectedModel,
+        '--effort', selectedEffort,
+      ]);
+      if (initRes && initRes.ok) {
+        activeTargetSid = String(initRes.target_session_id || '');
+        activeSpyMode = String(initRes.mode || 'hub');
+        activeStateFile = String(initRes.state_path || '');
+        activeFeedPath = String(initRes.feed_path || '');
+        feedOffset = 0;
+        const nextCwd = String(initRes.cwd || backend.getCwd());
+        backend.setCwd(nextCwd);
+        backend.setEnvOverrides(buildSpyEnvOverrides());
+        const nextTitle = String(initRes.title || '');
+        if (nextTitle) {
+          session.updateMetadata((curr) => ({
+            ...curr,
+            path: nextCwd,
+            name: nextTitle,
+            summary: { text: nextTitle, updatedAt: Date.now() },
+          }));
+        }
+        if (typeof initRes.card === 'string' && initRes.card.trim()) {
+          emitSyntheticAgentCard(initRes.card);
+        }
+      }
+    }
 
     while (!shouldExit) {
       const waitSignal = abortController.signal;
@@ -372,7 +751,7 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
       await modelsReady;
       sendEnvelopes(sessionManager.startTurn());
       try {
-        await backend.sendPrompt(process.cwd(), batch.message);
+        await backend.sendPrompt(backend.getCwd(), batch.message);
         sendEnvelopes(sessionManager.endTurn('completed'));
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
@@ -388,6 +767,11 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
       session.sendSessionEvent({ type: 'ready' });
     }
   } finally {
+    process.removeListener('SIGTERM', onSigTerm);
+    process.removeListener('SIGINT', onSigTerm);
+    if (feedInterval) {
+      clearInterval(feedInterval);
+    }
     clearInterval(keepAliveInterval);
     reconnectionHandle?.cancel();
 

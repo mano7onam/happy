@@ -57,6 +57,10 @@ export interface AgyBackendOptions {
   spawnFn?: SpawnFn;
   /** Optional override for resolving the resume conversation id (tests). */
   resolveConversationId?: (cwd: string) => string | null;
+  /** Optional override for the agy binary/shim path. */
+  agyBinOverride?: string;
+  /** Optional per-session env overrides passed to spawned agy processes. */
+  envOverrides?: Record<string, string>;
 }
 
 /** Parse an agy duration string ("10m", "30s", "1h") to milliseconds; defaults to 10m. */
@@ -69,11 +73,13 @@ function parsePrintTimeoutMs(value: string): number {
 
 export class AgyBackend implements AgentBackend {
   private readonly handlers = new Set<AgentMessageHandler>();
-  private readonly cwd: string;
+  private cwd: string;
   private readonly printTimeout: string;
   private readonly log: (msg: string) => void;
   private readonly spawnFn: SpawnFn;
   private readonly resolveConversationId: (cwd: string) => string | null;
+  private agyBinOverride?: string;
+  private envOverrides?: Record<string, string>;
 
   private permissionMode: PermissionMode;
   private model?: string;
@@ -90,6 +96,27 @@ export class AgyBackend implements AgentBackend {
     this.log = opts.log ?? (() => {});
     this.spawnFn = opts.spawnFn ?? spawn;
     this.resolveConversationId = opts.resolveConversationId ?? readAgyConversationId;
+    this.agyBinOverride = opts.agyBinOverride;
+    this.envOverrides = opts.envOverrides;
+  }
+
+  /** Update the working directory applied to subsequent turns. */
+  setCwd(cwd: string): void {
+    this.cwd = cwd;
+  }
+
+  getCwd(): string {
+    return this.cwd;
+  }
+
+  /** Reset pinned agy conversation id (e.g. when attaching/switching target session). */
+  resetConversation(): void {
+    this.conversationId = null;
+  }
+
+  /** Update per-session environment overrides passed to agy/shim. */
+  setEnvOverrides(overrides: Record<string, string> | undefined): void {
+    this.envOverrides = overrides;
   }
 
   /** Update the permission mode applied to subsequent turns. */
@@ -135,9 +162,11 @@ export class AgyBackend implements AgentBackend {
       this.conversationId === null ? this.resolveConversationId(this.cwd) : null;
 
     await new Promise<void>((resolve, reject) => {
-      const child = this.spawnFn(resolveAgyBin(), args, {
+      const bin = this.agyBinOverride || resolveAgyBin();
+      const childEnv = this.envOverrides ? { ...process.env, ...this.envOverrides } : process.env;
+      const child = this.spawnFn(bin, args, {
         cwd: this.cwd,
-        env: process.env,
+        env: childEnv,
         windowsHide: true,
         // agy --print blocks until stdin reaches EOF. We never write stdin, so
         // give the child an empty stdin (immediate EOF) instead of an open pipe;
