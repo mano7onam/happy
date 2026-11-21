@@ -169,6 +169,27 @@ export class AgyBackend implements AgentBackend {
 
     this.emit({ type: 'status', status: 'running' });
 
+    const maxAttempts = 4;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await this.runSingleTurnAttempt(args, attempt < maxAttempts);
+        return;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTransientDbRace =
+          msg.includes('empty conversation id') || msg.includes('initialized by another opener');
+        if (isTransientDbRace && attempt < maxAttempts) {
+          this.log(`transient agy DB init race on attempt ${attempt}/${maxAttempts}; retrying in 350ms...`);
+          await new Promise((r) => setTimeout(r, 350));
+          continue;
+        }
+        this.emit({ type: 'status', status: 'error', detail: msg });
+        throw err;
+      }
+    }
+  }
+
+  private async runSingleTurnAttempt(args: string[], suppressErrorEmit: boolean): Promise<void> {
     // Until we have pinned our own conversation, snapshot the cwd cache so we can
     // tell after the turn whether the entry is ours (changed → our turn wrote it)
     // or a leftover from another session (unchanged → not ours to adopt).
@@ -342,8 +363,7 @@ export class AgyBackend implements AgentBackend {
         const detail = (err as NodeJS.ErrnoException).code === 'ENOENT'
           ? `agy executable not found. Install the Antigravity CLI, or set HAPPY_AGY_PATH to its absolute path (tried 'agy' on PATH and ~/.local/bin/agy).`
           : err.message;
-        this.emit({ type: 'status', status: 'error', detail });
-        reject(err);
+        reject(new Error(detail));
       });
 
       child.on('close', (code: number | null) => {
@@ -374,7 +394,7 @@ export class AgyBackend implements AgentBackend {
           const detail = stderrDetail
             ? `agy exited with code ${code ?? 'null'}: ${stderrDetail}`
             : `agy exited with code ${code ?? 'null'}`;
-          this.emit({ type: 'status', status: 'error', detail });
+          void suppressErrorEmit;
           reject(new Error(detail));
         }
       });
