@@ -35,6 +35,11 @@ import { MessageBuffer } from '@/ui/ink/messageBuffer';
 import { AgyDisplay } from '@/ui/ink/AgyDisplay';
 import type { AgentMessage } from '@/agent/core';
 import { normalizeRemotePermissionMode } from '@/claude/utils/permissionMode';
+import {
+  isAudioAttachment,
+  registerHandySttRpc,
+  transcribeAudioBufferWithHandy,
+} from '@/handy/handySttBridge';
 import { AgyBackend } from './AgyBackend';
 import {
   DEFAULT_AGY_EFFORT,
@@ -432,22 +437,38 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
     }
 
     const savedAttachmentPaths: string[] = [];
+    const transcribedAudioTexts: string[] = [];
     if (attachmentsForThisMessage.length > 0) {
       try {
         mkdirSync(attachmentsDir, { recursive: true });
-        attachmentsForThisMessage.forEach((att, idx) => {
+        for (let idx = 0; idx < attachmentsForThisMessage.length; idx += 1) {
+          const att = attachmentsForThisMessage[idx];
+          if (isAudioAttachment(att.name, att.mimeType)) {
+            try {
+              const sttText = await transcribeAudioBufferWithHandy(att.data, att.name || 'voice.m4a');
+              if (sttText) {
+                transcribedAudioTexts.push(sttText);
+                emitSyntheticAgentCard(`🎙️ **Распознано (Handy Antigravity):**\n> ${sttText.replace(/\n/g, '\n> ')}`);
+              }
+            } catch (err) {
+              logger.debug('[agy] Handy STT audio attachment transcription failed:', err);
+            }
+            continue;
+          }
           const cleanBase = basename(att.name || `image-${idx + 1}`).replace(/[^a-zA-Z0-9._-]/g, '_');
           const ext = extensionForMime(att.mimeType, cleanBase);
           const filePath = join(attachmentsDir, `${Date.now()}-${idx + 1}-${cleanBase}${ext}`);
           writeFileSync(filePath, Buffer.from(att.data));
           savedAttachmentPaths.push(filePath);
-        });
+        }
       } catch (err) {
         logger.debug('[agy] Failed to persist decrypted attachments:', err);
       }
     }
 
-    const trimmedText = rawUserText.trim();
+    const effectiveUserText = [rawUserText.trim(), ...transcribedAudioTexts].filter(Boolean).join('\n\n');
+    const trimmedText = effectiveUserText.trim();
+    if (!trimmedText && savedAttachmentPaths.length === 0) return;
     if (/^\/models$/i.test(trimmedText)) {
       const listText = availableModelCodes
         .map((code, idx) => `${idx + 1}. ${code}${code === selectedModel ? ` ✓ (current: ${displayedModel})` : ''}`)
@@ -600,14 +621,14 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
       return;
     }
 
-    let outgoingPrompt = rawUserText;
+    let outgoingPrompt = effectiveUserText;
     if (savedAttachmentPaths.length > 0) {
       const filesList = savedAttachmentPaths.map((p) => `- ${p}`).join('\n');
       const header =
         `[Прикреплены скриншоты/изображения с телефона (${savedAttachmentPaths.length} шт.). ` +
         `Обязательно открой и посмотри каждый файл через инструмент \`read_file\` перед ответом:\n${filesList}]`;
-      outgoingPrompt = rawUserText.trim()
-        ? `${header}\n\n${rawUserText}`
+      outgoingPrompt = effectiveUserText.trim()
+        ? `${header}\n\n${effectiveUserText}`
         : `${header}\n\nПосмотри на прикреплённый скриншот и опиши, что видишь / помоги с этим.`;
     }
 
@@ -638,6 +659,7 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
   }
 
   session.rpcHandlerManager.registerHandler('abort', handleAbort);
+  registerHandySttRpc(session.rpcHandlerManager);
   const requestGracefulShutdown = async () => {
     if (shouldExit) return;
     shouldExit = true;
