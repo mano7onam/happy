@@ -509,6 +509,13 @@ export async function runAgy(opts: RunAgyOptions): Promise<void> {
       return;
     }
 
+    if (hasSpyToolkit && /^\/(quota|usage)$/i.test(trimmedText)) {
+      const res = runSpyMobileCtl(['quota']);
+      const reply = typeof res?.text === 'string' ? res.text : 'Не удалось получить остаток квоты Antigravity.';
+      emitSyntheticAgentCard(reply);
+      return;
+    }
+
     const spyAttachMatch = /^\/(spy|relay)(?:\s+(.*))?$/i.exec(trimmedText);
     if (hasSpyToolkit && spyAttachMatch) {
       const cmdKind = spyAttachMatch[1].toLowerCase() === 'relay' ? 'relay' : 'companion';

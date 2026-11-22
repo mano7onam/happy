@@ -6,10 +6,29 @@
  * `upstream/main` only touch two hook lines in `apiMachine.ts`.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { logger } from '@/ui/logger';
 
 export const HANDY_STT_METHOD = 'handy-stt';
 export const DEFAULT_HANDY_STT_URL = 'http://127.0.0.1:8787';
+
+function readHandyStateFile(name: string): string {
+  try {
+    const p = join(homedir(), '.stt-handy-antigravity', name);
+    if (existsSync(p)) {
+      return readFileSync(p, 'utf8').trim();
+    }
+  } catch {
+    // ignore
+  }
+  return '';
+}
+
+function resolveHandyApiToken(): string {
+  return (process.env.STT_HANDY_API_TOKEN || readHandyStateFile('remote_api_token')).trim();
+}
 
 const AUDIO_EXTENSIONS = new Set([
   '.m4a',
@@ -48,7 +67,13 @@ export interface HandySttRpcResponse {
 }
 
 export function resolveHandySttBaseUrl(explicit?: string): string {
-  return (explicit || process.env.HANDY_STT_URL || DEFAULT_HANDY_STT_URL).replace(/\/+$/, '');
+  if (explicit) return explicit.replace(/\/+$/, '');
+  if (process.env.HANDY_STT_URL) return process.env.HANDY_STT_URL.replace(/\/+$/, '');
+  const vpsTunnelUrl = readHandyStateFile('tunnel_url.txt').replace(/\/+$/, '');
+  if (vpsTunnelUrl.startsWith('https://')) {
+    return vpsTunnelUrl;
+  }
+  return DEFAULT_HANDY_STT_URL;
 }
 
 export function isAudioAttachment(filename: string, mimeType?: string): boolean {
@@ -66,9 +91,14 @@ async function postHandyJson(
   payload: Record<string, unknown>,
   timeoutMs: number,
 ): Promise<Record<string, unknown>> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json; charset=utf-8' };
+  const tok = resolveHandyApiToken();
+  if (tok) {
+    headers['Authorization'] = `Bearer ${tok}`;
+  }
   const res = await fetch(`${baseUrl}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    headers,
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(timeoutMs),
   });
